@@ -9,17 +9,31 @@
 #   pip install PySide6 openpyxl pypdf reportlab qrcode pymupdf
 #
 # Usage:
-#   .\build.ps1                # build, bundle SumatraPDF
+#   .\build.ps1                # build, bundle SumatraPDF, slim deps (default)
+#   .\build.ps1 -WithPreview   # ALSO bundle pymupdf for live preview
+#                              # (adds ~30 min to compile time + ~150 MB)
 #   .\build.ps1 -Onefile       # single OpenName.exe (slower startup)
 #   .\build.ps1 -Clean         # wipe dist\ first
 #   .\build.ps1 -NoSumatra     # skip SumatraPDF download (printing won't work
 #                              # unless SumatraPDF is already installed)
+#
+# Why exclusions
+# --------------
+# OpenName imports `fitz` (pymupdf) only for the optional live preview pane,
+# guarded by a try/except ImportError. Letting Nuitka follow it pulls in
+# pymupdf.mupdf which is one C file >100k LOC -- Zig takes 30+ minutes to
+# compile it, often hangs. scipy/pandas/matplotlib/numpy/tkinter aren't
+# actually used by OpenName at all but get pulled transitively. Excluding
+# them cuts the build from ~1.5 hours to ~5 minutes and the dist size
+# from ~700 MB to ~130 MB. -WithPreview re-enables pymupdf for users who
+# want the live preview pane back.
 
 [CmdletBinding()]
 param(
     [switch]$Onefile,
     [switch]$Clean,
-    [switch]$NoSumatra
+    [switch]$NoSumatra,
+    [switch]$WithPreview
 )
 
 $ErrorActionPreference = "Stop"
@@ -50,6 +64,18 @@ $nuitkaArgs = @(
     "--output-filename=OpenName.exe",
     "--remove-output"
 )
+
+# Heavy/unused deps that Nuitka would otherwise pull in transitively. See
+# the header for why.
+$exclusions = @(
+    "scipy", "pandas", "matplotlib", "tkinter", "test", "unittest"
+)
+if (-not $WithPreview) {
+    $exclusions += @("fitz", "pymupdf", "numpy")
+}
+foreach ($pkg in $exclusions) {
+    $nuitkaArgs += "--nofollow-import-to=$pkg"
+}
 
 if ($Onefile) {
     $nuitkaArgs += "--onefile"
