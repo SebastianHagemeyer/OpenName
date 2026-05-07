@@ -66,6 +66,28 @@ SETTINGS_PATH = SCRIPT_DIR / "OpenName.settings.json"
 ICON_PATH = BUNDLE_DIR / "paper.ico"
 
 
+def _qmark_class_override() -> Path | None:
+    """Return the qmark-supplied class roster path if set and valid.
+
+    qmark passes QMARK_CLASS_PATH (an absolute .xlsx) so OpenName uses
+    the same roster the dashboard is marking against. When unset, OpenName
+    falls back to discovering rosters in its own Classes/ folder.
+    """
+    p = os.environ.get("QMARK_CLASS_PATH", "").strip()
+    if not p:
+        return None
+    path = Path(p)
+    return path if path.is_file() else None
+
+
+def _class_xlsx_for(name: str) -> Path:
+    """Resolve a displayed class name to its .xlsx file."""
+    override = _qmark_class_override()
+    if override is not None and override.stem == name:
+        return override
+    return CLASSES_DIR / f"{name}.xlsx"
+
+
 def _find_sumatra() -> Path:
     """Locate SumatraPDF.exe — prefer a copy bundled next to us, then fall
     back to the user's installed copy. The bundled-first order means the
@@ -378,7 +400,31 @@ class App(QMainWindow):
                 pass
         if not s.get("date_text"):
             s["date_text"] = datetime.now().strftime("%d/%m/%Y")
-        if not s.get("last_pdf") or not Path(s["last_pdf"]).exists():
+        # Decide the initial PDF. Priority:
+        #   1. QMARK_SHEET_PATH (qmark passes the session-bound worksheet)
+        #   2. The previously-saved last_pdf, IF it still exists AND
+        #      (when QMARK_SHEETS_DIR is set) it lives inside Sheets/
+        #   3. First PDF in QMARK_SHEETS_DIR
+        #   4. First PDF next to OpenName.py (standalone fallback,
+        #      typically measurementsheet.pdf)
+        sheet_override = os.environ.get("QMARK_SHEET_PATH", "")
+        if sheet_override and Path(sheet_override).is_file():
+            s["last_pdf"] = sheet_override
+            return s
+
+        sheets_dir = os.environ.get("QMARK_SHEETS_DIR", "")
+        sheets_path = Path(sheets_dir) if sheets_dir else None
+        last = s.get("last_pdf") or ""
+        last_ok = bool(last) and Path(last).exists()
+        if sheets_path and sheets_path.is_dir():
+            try:
+                in_sheets = last_ok and sheets_path in Path(last).resolve().parents
+            except Exception:
+                in_sheets = False
+            if not in_sheets:
+                pdfs = sorted(sheets_path.glob("*.pdf"))
+                s["last_pdf"] = str(pdfs[0]) if pdfs else ""
+        elif not last_ok:
             pdfs = sorted(SCRIPT_DIR.glob("*.pdf"))
             s["last_pdf"] = str(pdfs[0]) if pdfs else ""
         return s
@@ -659,12 +705,17 @@ class App(QMainWindow):
     # ---- class / student data ------------------------------------------- #
 
     def _refresh_classes(self) -> None:
-        if not CLASSES_DIR.exists():
+        # When qmark passes a class roster, that's the only option — qmark
+        # owns the roster in this mode. Otherwise glob the local Classes/.
+        override = _qmark_class_override()
+        if override is not None:
+            names = [override.stem]
+        elif CLASSES_DIR.exists():
+            names = [f.stem for f in sorted(CLASSES_DIR.glob("*.xlsx"))]
+        else:
             self.class_combo.clear()
             self._set_status(f"Classes folder not found: {CLASSES_DIR}")
             return
-        files = sorted(CLASSES_DIR.glob("*.xlsx"))
-        names = [f.stem for f in files]
         self.class_combo.blockSignals(True)
         self.class_combo.clear()
         self.class_combo.addItems(names)
@@ -696,7 +747,7 @@ class App(QMainWindow):
         if not cls:
             self.count_label.setText("")
             return
-        xlsx = CLASSES_DIR / f"{cls}.xlsx"
+        xlsx = _class_xlsx_for(cls)
         if not xlsx.exists():
             self.count_label.setText("")
             self._set_status(f"Class file not found: {xlsx}")

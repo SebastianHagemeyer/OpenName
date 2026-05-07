@@ -9,6 +9,10 @@ Classes/*.xlsx
 # User-specific runtime settings (printer paths, last-used class, etc.)
 OpenName.settings.json
 
+# Downloaded SumatraPDF binary (the build script + qmark dashboard fetch
+# this on demand; pinned version lives in build.ps1).
+SumatraPDF.exe
+
 # Python build / cache
 __pycache__/
 *.pyc
