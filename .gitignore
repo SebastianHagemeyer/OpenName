@@ -1,0 +1,24 @@
+# PDFs (worksheets) — only the example template is tracked.
+*.pdf
+!measurementsheet.pdf
+
+# Class rosters — never commit real student data. Examples are tracked.
+Classes/*.xlsx
+!Classes/Example*.xlsx
+
+# User-specific runtime settings (printer paths, last-used class, etc.)
+OpenName.settings.json
+
+# Python build / cache
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# IDE / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
