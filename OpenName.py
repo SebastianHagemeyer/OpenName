@@ -732,9 +732,15 @@ class App(QMainWindow):
     # ---- buttons --------------------------------------------------------- #
 
     def _browse_pdf(self) -> None:
-        initialdir = str(SCRIPT_DIR)
-        if self.pdf_edit.text() and Path(self.pdf_edit.text()).exists():
+        # Default to QMARK_SHEETS_DIR when launched from the qmark dashboard,
+        # else fall back to the parent of the last-used PDF, else SCRIPT_DIR.
+        sheets_dir = os.environ.get("QMARK_SHEETS_DIR", "")
+        if sheets_dir and Path(sheets_dir).is_dir():
+            initialdir = sheets_dir
+        elif self.pdf_edit.text() and Path(self.pdf_edit.text()).exists():
             initialdir = str(Path(self.pdf_edit.text()).parent)
+        else:
+            initialdir = str(SCRIPT_DIR)
         path, _ = QFileDialog.getOpenFileName(
             self,
             "Select PDF to stamp",
