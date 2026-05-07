@@ -64,7 +64,26 @@ BUNDLE_DIR = Path(__file__).resolve().parent  # for assets shipped with the buil
 CLASSES_DIR = SCRIPT_DIR / "Classes"
 SETTINGS_PATH = SCRIPT_DIR / "OpenName.settings.json"
 ICON_PATH = BUNDLE_DIR / "paper.ico"
-SUMATRA_PATH = Path(os.environ.get("LOCALAPPDATA", "")) / "SumatraPDF" / "SumatraPDF.exe"
+
+
+def _find_sumatra() -> Path:
+    """Locate SumatraPDF.exe — prefer a copy bundled next to us, then fall
+    back to the user's installed copy. The bundled-first order means the
+    distributable .zip works without a separate SumatraPDF install."""
+    local_appdata = Path(os.environ.get("LOCALAPPDATA", ""))
+    program_files = Path(os.environ.get("ProgramFiles", r"C:\Program Files"))
+    candidates = [
+        SCRIPT_DIR / "SumatraPDF.exe",
+        local_appdata / "SumatraPDF" / "SumatraPDF.exe",
+        program_files / "SumatraPDF" / "SumatraPDF.exe",
+    ]
+    for c in candidates:
+        if c.exists():
+            return c
+    return candidates[1]  # default for the "not found" error message
+
+
+SUMATRA_PATH = _find_sumatra()
 
 DEFAULTS = {
     "last_pdf": "",

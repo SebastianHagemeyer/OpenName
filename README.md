@@ -104,23 +104,26 @@ with sensitive content won't be committed.
 ## Building a standalone .exe
 
 You can compile OpenName into a self-contained Windows executable (with all
-the necessary DLLs and Qt plugins bundled) using [Nuitka](https://nuitka.net/):
+the necessary DLLs, Qt plugins, **and SumatraPDF** bundled) using
+[Nuitka](https://nuitka.net/):
 
 ```powershell
 pip install nuitka
-.\build.ps1            # produces dist\OpenName.dist\OpenName.exe + DLLs
-.\build.ps1 -Onefile   # produces a single dist\OpenName.exe (slower startup)
-.\build.ps1 -Clean     # wipe dist\ before rebuilding
+.\build.ps1              # dist\OpenName.dist\OpenName.exe + DLLs + SumatraPDF
+.\build.ps1 -Onefile     # single dist\OpenName.exe (slower startup)
+.\build.ps1 -Clean       # wipe dist\ before rebuilding
+.\build.ps1 -NoSumatra   # skip SumatraPDF download (smaller, but printing
+                         # then requires a separate SumatraPDF install)
 ```
 
 The first build downloads the MSVC/MinGW toolchain Nuitka uses and takes a
 few minutes; subsequent builds are much faster. To distribute, zip up the
 entire `OpenName.dist` folder (or just ship the single `OpenName.exe` if you
-used `-Onefile`). Drop `Classes/` and your worksheet PDFs next to the .exe
-and it'll find them.
+used `-Onefile`). End users drop `Classes/` and their worksheet PDFs next to
+`OpenName.exe` — no Python, no SumatraPDF install, no DLL hunt.
 
-SumatraPDF is **not** bundled — printing still requires it to be installed at
-`%LOCALAPPDATA%\SumatraPDF\SumatraPDF.exe` on the target machine.
+The bundled SumatraPDF is unmodified and licensed under GPL-3.0; the dist
+folder includes a `SumatraPDF.NOTICE.txt` pointing at the source.
 
 ## Privacy note
 

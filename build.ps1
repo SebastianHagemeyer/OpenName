@@ -1,25 +1,34 @@
-# Build a standalone, distributable OpenName.exe with Nuitka.
+# Build a standalone, distributable OpenName.exe with Nuitka and bundle
+# SumatraPDF (used for printing) so the resulting folder runs without any
+# extra install on the target machine.
 #
-# Output: dist\OpenName.dist\OpenName.exe (and the DLLs/Qt plugins it needs).
+# Output: dist\OpenName.dist\OpenName.exe (+ DLLs, Qt plugins, SumatraPDF.exe).
 #
 # Prereqs:
 #   pip install nuitka
 #   pip install PySide6 openpyxl pypdf reportlab qrcode pymupdf
 #
 # Usage:
-#   .\build.ps1                # build into .\dist
-#   .\build.ps1 -Onefile       # build a single OpenName.exe (slower startup)
-#   .\build.ps1 -Clean         # delete .\dist before building
+#   .\build.ps1                # build, bundle SumatraPDF
+#   .\build.ps1 -Onefile       # single OpenName.exe (slower startup)
+#   .\build.ps1 -Clean         # wipe dist\ first
+#   .\build.ps1 -NoSumatra     # skip SumatraPDF download (printing won't work
+#                              # unless SumatraPDF is already installed)
 
 [CmdletBinding()]
 param(
     [switch]$Onefile,
-    [switch]$Clean
+    [switch]$Clean,
+    [switch]$NoSumatra
 )
 
 $ErrorActionPreference = "Stop"
 $root = $PSScriptRoot
 Set-Location $root
+
+# Pinned for reproducibility. Bump when a newer SumatraPDF release is available.
+$SumatraVersion = "3.5.2"
+$SumatraUrl = "https://www.sumatrapdfreader.org/dl/rel/$SumatraVersion/SumatraPDF-$SumatraVersion-64.exe"
 
 if ($Clean -and (Test-Path "$root\dist")) {
     Write-Host "Removing existing dist/ ..." -ForegroundColor Yellow
@@ -55,8 +64,55 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 if ($Onefile) {
-    Write-Host "`nBuilt: dist\OpenName.exe" -ForegroundColor Green
+    $distDir = "$root\dist"
+    $exePath = "$distDir\OpenName.exe"
 } else {
-    Write-Host "`nBuilt: dist\OpenName.dist\OpenName.exe" -ForegroundColor Green
-    Write-Host "Distribute the entire 'OpenName.dist' folder." -ForegroundColor Green
+    $distDir = "$root\dist\OpenName.dist"
+    $exePath = "$distDir\OpenName.exe"
+}
+
+if (-not (Test-Path $exePath)) {
+    throw "Build claimed success but $exePath does not exist."
+}
+
+if (-not $NoSumatra) {
+    $sumatraDest = Join-Path $distDir "SumatraPDF.exe"
+    Write-Host "`nDownloading SumatraPDF $SumatraVersion (portable, ~7 MB) ..." -ForegroundColor Cyan
+    try {
+        Invoke-WebRequest -Uri $SumatraUrl -OutFile $sumatraDest -UseBasicParsing
+        Write-Host "  -> $sumatraDest" -ForegroundColor DarkGray
+    } catch {
+        Write-Warning "Failed to download SumatraPDF: $_"
+        Write-Warning "Build is otherwise complete; printing will require a separate SumatraPDF install."
+    }
+
+    # GPL-3.0 written-offer notice for the bundled SumatraPDF binary.
+    $noticePath = Join-Path $distDir "SumatraPDF.NOTICE.txt"
+    $notice = @"
+This distribution of OpenName includes SumatraPDF, an unmodified third-party
+binary used to send PDFs to the printer.
+
+  SumatraPDF version: $SumatraVersion
+  SumatraPDF homepage: https://www.sumatrapdfreader.org/
+  SumatraPDF source code: https://github.com/sumatrapdfreader/sumatrapdf
+  SumatraPDF license: GPL-3.0 (https://www.gnu.org/licenses/gpl-3.0.txt)
+
+OpenName itself is MIT-licensed; see LICENSE.txt next to OpenName.exe.
+"@
+    Set-Content -Path $noticePath -Value $notice -Encoding UTF8
+}
+
+# Copy the OpenName MIT license into the dist so the whole folder is shippable.
+if (Test-Path "$root\LICENSE") {
+    Copy-Item "$root\LICENSE" -Destination (Join-Path $distDir "LICENSE.txt") -Force
+}
+
+Write-Host ""
+Write-Host "Build complete." -ForegroundColor Green
+Write-Host "  Executable: $exePath" -ForegroundColor Green
+if (-not $Onefile) {
+    Write-Host "  Distribute the entire 'OpenName.dist' folder (zip and ship)." -ForegroundColor Green
+}
+if (-not $NoSumatra) {
+    Write-Host "  SumatraPDF bundled. End users do not need a separate install." -ForegroundColor Green
 }
