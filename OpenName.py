@@ -28,7 +28,7 @@ from reportlab.pdfgen import canvas as rl_canvas
 from reportlab.lib.utils import ImageReader
 
 from PySide6.QtCore import Qt, QObject, QTimer, Signal
-from PySide6.QtGui import QImage, QPixmap
+from PySide6.QtGui import QIcon, QImage, QPixmap
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QFileDialog, QFrame, QGridLayout,
     QGroupBox, QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMessageBox,
@@ -53,9 +53,17 @@ except ImportError:
 # Paths and defaults                                                          #
 # --------------------------------------------------------------------------- #
 
-SCRIPT_DIR = Path(__file__).resolve().parent
+# When frozen by Nuitka/PyInstaller, __file__ points inside the bundle, so we
+# resolve paths next to the executable instead — that way Classes/ and PDFs
+# the user drops next to OpenName.exe are picked up.
+if "__compiled__" in globals() or getattr(sys, "frozen", False):
+    SCRIPT_DIR = Path(sys.executable).resolve().parent
+else:
+    SCRIPT_DIR = Path(__file__).resolve().parent
+BUNDLE_DIR = Path(__file__).resolve().parent  # for assets shipped with the build
 CLASSES_DIR = SCRIPT_DIR / "Classes"
 SETTINGS_PATH = SCRIPT_DIR / "OpenName.settings.json"
+ICON_PATH = BUNDLE_DIR / "paper.ico"
 SUMATRA_PATH = Path(os.environ.get("LOCALAPPDATA", "")) / "SumatraPDF" / "SumatraPDF.exe"
 
 DEFAULTS = {
@@ -312,6 +320,8 @@ class App(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("OpenName")
+        if ICON_PATH.exists():
+            self.setWindowIcon(QIcon(str(ICON_PATH)))
         self.resize(1280, 860)
         self.setMinimumSize(960, 700)
 
@@ -953,7 +963,17 @@ def main() -> None:
         # Show a warning but still let the GUI start (preview still works).
         print(f"Warning: SumatraPDF not found at {SUMATRA_PATH}. "
               f"Preview will work but printing will fail.", file=sys.stderr)
+    # Without an explicit AppUserModelID, Windows groups us under the python.exe
+    # icon in the taskbar instead of using the window icon we set below.
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("OpenName")
+        except Exception:
+            pass
     app = QApplication(sys.argv)
+    if ICON_PATH.exists():
+        app.setWindowIcon(QIcon(str(ICON_PATH)))
     win = App()
     win.show()
     sys.exit(app.exec())

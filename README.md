@@ -30,6 +30,8 @@ position sliders.
 OpenName/
 ├── OpenName.py                # GUI + stamping/printing logic
 ├── OpenName.bat               # Windows double-click launcher
+├── build.ps1                  # Nuitka build script -> standalone .exe
+├── paper.ico                  # Window/taskbar icon
 ├── measurementsheet.pdf       # Example worksheet (replace with your own)
 ├── Classes/
 │   ├── ExampleClass.xlsx      # Example roster (column A = student names, row 1 = header)
@@ -98,6 +100,27 @@ with sensitive content won't be committed.
   settings are saved to `OpenName.settings.json` for next launch.
 - **Export combined PDF** — concatenates every selected student's stamped
   copy into a single PDF (useful for testing without burning paper).
+
+## Building a standalone .exe
+
+You can compile OpenName into a self-contained Windows executable (with all
+the necessary DLLs and Qt plugins bundled) using [Nuitka](https://nuitka.net/):
+
+```powershell
+pip install nuitka
+.\build.ps1            # produces dist\OpenName.dist\OpenName.exe + DLLs
+.\build.ps1 -Onefile   # produces a single dist\OpenName.exe (slower startup)
+.\build.ps1 -Clean     # wipe dist\ before rebuilding
+```
+
+The first build downloads the MSVC/MinGW toolchain Nuitka uses and takes a
+few minutes; subsequent builds are much faster. To distribute, zip up the
+entire `OpenName.dist` folder (or just ship the single `OpenName.exe` if you
+used `-Onefile`). Drop `Classes/` and your worksheet PDFs next to the .exe
+and it'll find them.
+
+SumatraPDF is **not** bundled — printing still requires it to be installed at
+`%LOCALAPPDATA%\SumatraPDF\SumatraPDF.exe` on the target machine.
 
 ## Privacy note
 

@@ -16,6 +16,12 @@ __pycache__/
 .venv/
 venv/
 
+# Nuitka build artefacts
+dist/
+*.build/
+*.dist/
+*.onefile-build/
+
 # IDE / OS
 .vscode/
 .idea/
