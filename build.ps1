@@ -58,6 +58,8 @@ $nuitkaArgs = @(
     "--windows-icon-from-ico=paper.ico",
     "--include-data-files=paper.ico=paper.ico",
     "--product-name=OpenName",
+    "--product-version=1.0.0",
+    "--file-version=1.0.0",
     "--file-description=OpenName - per-student name sheet stamper",
     "--copyright=MIT - https://github.com/SebastianHagemeyer/OpenName",
     "--output-dir=dist",
