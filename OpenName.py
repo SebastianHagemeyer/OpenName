@@ -45,8 +45,54 @@ except ImportError:
 try:
     import fitz  # PyMuPDF — used for the live preview pane
     HAS_PREVIEW = True
-except ImportError:
+except ImportError as _preview_import_err:
     HAS_PREVIEW = False
+    # Diagnostic: when bundled inside an MSIX (read-only install, no pip),
+    # the "pip install pymupdf" banner is unactionable. Write a one-shot
+    # diag log on the failure path so we can see WHY the import failed
+    # instead of guessing. No-op when fitz imports successfully.
+    try:
+        import sys as _sys, os as _os, traceback as _tb, ctypes as _ct
+        _diag_path = _os.path.join(
+            _os.environ.get("LOCALAPPDATA") or _os.path.expanduser("~"),
+            "openname-import-diag.log",
+        )
+        with open(_diag_path, "w", encoding="utf-8") as _f:
+            _f.write(f"--- fitz import error ---\n{_preview_import_err!r}\n\n")
+            _f.write(f"sys.executable: {_sys.executable}\n")
+            _f.write(f"__file__: {globals().get('__file__', '?')}\n")
+            _f.write(f"cwd: {_os.getcwd()}\n\n")
+            _f.write("sys.path:\n")
+            for _p in _sys.path:
+                _f.write(f"  {_p}\n")
+            _f.write("\n--- direct pymupdf import attempt ---\n")
+            try:
+                import pymupdf as _pm
+                _f.write(f"pymupdf imported OK from {_pm.__file__}\n")
+            except Exception as _e:
+                _f.write(f"pymupdf also failed: {_e!r}\n")
+                _f.write(_tb.format_exc())
+            _f.write("\n--- direct mupdfcpp64.dll LoadLibrary attempt ---\n")
+            _exe_dir = _os.path.dirname(_sys.executable)
+            for _candidate in (
+                _os.path.join(_exe_dir, "mupdfcpp64.dll"),
+                _os.path.join(_exe_dir, "pymupdf", "mupdfcpp64.dll"),
+                "mupdfcpp64.dll",
+            ):
+                _exists = _os.path.isfile(_candidate) if _candidate.endswith(".dll") and _os.path.sep in _candidate else "n/a"
+                try:
+                    _ct.WinDLL(_candidate)
+                    _f.write(f"  {_candidate} (exists={_exists}): LOADED OK\n")
+                except OSError as _le:
+                    _f.write(f"  {_candidate} (exists={_exists}): {_le!r}\n")
+            _f.write("\n--- bundled tree probe ---\n")
+            for _rel in ("fitz", "fitz/__init__.py", "pymupdf", "pymupdf/__init__.py",
+                         "pymupdf/_mupdf.pyd", "pymupdf/mupdfcpp64.dll", "mupdfcpp64.dll",
+                         "numpy", "numpy/__init__.py"):
+                _abs = _os.path.join(_exe_dir, _rel)
+                _f.write(f"  {_rel}: exists={_os.path.exists(_abs)}\n")
+    except Exception:
+        pass
 
 
 # --------------------------------------------------------------------------- #
