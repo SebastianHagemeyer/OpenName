@@ -142,6 +142,20 @@ if ($WithPreviewFast -and -not $Onefile) {
         $size = [math]::Round(((Get-ChildItem $dst -Recurse -File | Measure-Object Length -Sum).Sum) / 1MB, 1)
         Write-Host "  $($pkg.PadRight(8)) -> $dst ($size MB)" -ForegroundColor DarkGray
     }
+    # Mirror any DLLs found inside the bundled packages to the dist root.
+    # _mupdf.pyd depends on mupdfcpp64.dll, but Windows DLL search defaults
+    # to the .exe's directory and won't look inside pymupdf/. Without this
+    # mirror, `import fitz` silently fails with ImportError and OpenName
+    # falls back to the "Live preview disabled" banner.
+    $sideDlls = Get-ChildItem -Path (Join-Path $distDir "pymupdf"), (Join-Path $distDir "numpy") `
+                              -Filter *.dll -Recurse -ErrorAction SilentlyContinue
+    foreach ($dll in $sideDlls) {
+        $rootCopy = Join-Path $distDir $dll.Name
+        if (-not (Test-Path $rootCopy)) {
+            Copy-Item $dll.FullName $rootCopy -Force
+            Write-Host "  Mirrored $($dll.Name) -> dist root for DLL search" -ForegroundColor DarkGray
+        }
+    }
 }
 
 if (-not $NoSumatra) {
