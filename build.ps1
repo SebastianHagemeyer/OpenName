@@ -9,13 +9,19 @@
 #   pip install PySide6 openpyxl pypdf reportlab qrcode pymupdf
 #
 # Usage:
-#   .\build.ps1                # build, bundle SumatraPDF, slim deps (default)
-#   .\build.ps1 -WithPreview   # ALSO bundle pymupdf for live preview
-#                              # (adds ~30 min to compile time + ~150 MB)
-#   .\build.ps1 -Onefile       # single OpenName.exe (slower startup)
-#   .\build.ps1 -Clean         # wipe dist\ first
-#   .\build.ps1 -NoSumatra     # skip SumatraPDF download (printing won't work
-#                              # unless SumatraPDF is already installed)
+#   .\build.ps1                    # build, bundle SumatraPDF, slim deps (default)
+#   .\build.ps1 -WithPreview       # ALSO compile pymupdf for live preview via
+#                                  # Nuitka (adds ~30 min build + ~150 MB,
+#                                  # often hangs on the mupdf C compile).
+#   .\build.ps1 -WithPreviewFast   # Bundle pre-built pymupdf + fitz + numpy
+#                                  # via post-build Copy-Item instead of
+#                                  # letting Nuitka compile them (no Zig hang,
+#                                  # adds ~60 MB, ~5 sec extra build time).
+#                                  # Recommended for Store-bound MSIX builds.
+#   .\build.ps1 -Onefile           # single OpenName.exe (slower startup)
+#   .\build.ps1 -Clean             # wipe dist\ first
+#   .\build.ps1 -NoSumatra         # skip SumatraPDF download (printing won't
+#                                  # work unless SumatraPDF is already installed)
 #
 # Why exclusions
 # --------------
@@ -33,7 +39,8 @@ param(
     [switch]$Onefile,
     [switch]$Clean,
     [switch]$NoSumatra,
-    [switch]$WithPreview
+    [switch]$WithPreview,
+    [switch]$WithPreviewFast
 )
 
 $ErrorActionPreference = "Stop"
@@ -73,11 +80,22 @@ $exclusions = @(
     "scipy", "pandas", "matplotlib", "tkinter", "test", "unittest"
 )
 if (-not $WithPreview) {
+    # -WithPreviewFast also keeps these in --nofollow-import-to so Nuitka
+    # doesn't try to compile pymupdf's huge C source. Pre-built binaries
+    # are bundled as a data dir below.
     $exclusions += @("fitz", "pymupdf", "numpy")
 }
 foreach ($pkg in $exclusions) {
     $nuitkaArgs += "--nofollow-import-to=$pkg"
 }
+
+# -WithPreviewFast: pymupdf is bundled below as a POST-BUILD copy of the
+# pre-built site-packages dir, not via --include-data-dir (which silently
+# filters out .pyd/.dll/.py files because it thinks they're code, not
+# data, and Nuitka's anti-bloat plugin won't copy them). Nuitka skips
+# its own Zig compile of pymupdf.mupdf entirely (saves 30+ min, no hang
+# risk). The OpenName runtime imports pymupdf because the standalone
+# dist root is on sys.path, so a sibling pymupdf/ folder is importable.
 
 if ($Onefile) {
     $nuitkaArgs += "--onefile"
@@ -101,6 +119,29 @@ if ($Onefile) {
 
 if (-not (Test-Path $exePath)) {
     throw "Build claimed success but $exePath does not exist."
+}
+
+# -WithPreviewFast post-build: copy pre-built pymupdf + fitz + numpy
+# verbatim into the dist tree. We do this here (not via --include-data-dir)
+# because Nuitka's anti-bloat plugin filters .pyd/.py/.dll out of data
+# dirs. The dist root is on the standalone Python's sys.path, so a
+# sibling <pkg>/ folder is importable at runtime.
+if ($WithPreviewFast -and -not $Onefile) {
+    Write-Host "`nCopying pre-built pymupdf + fitz + numpy into dist ..." -ForegroundColor Cyan
+    foreach ($pkg in @("pymupdf", "fitz", "numpy")) {
+        $src = & python -c "import $pkg, os; print(os.path.dirname($pkg.__file__))" 2>$null
+        if ($LASTEXITCODE -ne 0 -or -not $src -or -not (Test-Path $src)) {
+            throw "$pkg not importable; install with 'pip install pymupdf numpy' before using -WithPreviewFast."
+        }
+        $dst = Join-Path $distDir $pkg
+        if (Test-Path $dst) { Remove-Item -Recurse -Force $dst }
+        Copy-Item -Recurse -Force $src $dst
+        # Strip __pycache__ — wastes space, gets regenerated on first import
+        Get-ChildItem $dst -Recurse -Directory -Filter __pycache__ -ErrorAction SilentlyContinue |
+            Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+        $size = [math]::Round(((Get-ChildItem $dst -Recurse -File | Measure-Object Length -Sum).Sum) / 1MB, 1)
+        Write-Host "  $($pkg.PadRight(8)) -> $dst ($size MB)" -ForegroundColor DarkGray
+    }
 }
 
 if (-not $NoSumatra) {
