@@ -45,54 +45,8 @@ except ImportError:
 try:
     import fitz  # PyMuPDF — used for the live preview pane
     HAS_PREVIEW = True
-except ImportError as _preview_import_err:
+except ImportError:
     HAS_PREVIEW = False
-    # Diagnostic: when bundled inside an MSIX (read-only install, no pip),
-    # the "pip install pymupdf" banner is unactionable. Write a one-shot
-    # diag log on the failure path so we can see WHY the import failed
-    # instead of guessing. No-op when fitz imports successfully.
-    try:
-        import sys as _sys, os as _os, traceback as _tb, ctypes as _ct
-        _diag_path = _os.path.join(
-            _os.environ.get("LOCALAPPDATA") or _os.path.expanduser("~"),
-            "openname-import-diag.log",
-        )
-        with open(_diag_path, "w", encoding="utf-8") as _f:
-            _f.write(f"--- fitz import error ---\n{_preview_import_err!r}\n\n")
-            _f.write(f"sys.executable: {_sys.executable}\n")
-            _f.write(f"__file__: {globals().get('__file__', '?')}\n")
-            _f.write(f"cwd: {_os.getcwd()}\n\n")
-            _f.write("sys.path:\n")
-            for _p in _sys.path:
-                _f.write(f"  {_p}\n")
-            _f.write("\n--- direct pymupdf import attempt ---\n")
-            try:
-                import pymupdf as _pm
-                _f.write(f"pymupdf imported OK from {_pm.__file__}\n")
-            except Exception as _e:
-                _f.write(f"pymupdf also failed: {_e!r}\n")
-                _f.write(_tb.format_exc())
-            _f.write("\n--- direct mupdfcpp64.dll LoadLibrary attempt ---\n")
-            _exe_dir = _os.path.dirname(_sys.executable)
-            for _candidate in (
-                _os.path.join(_exe_dir, "mupdfcpp64.dll"),
-                _os.path.join(_exe_dir, "pymupdf", "mupdfcpp64.dll"),
-                "mupdfcpp64.dll",
-            ):
-                _exists = _os.path.isfile(_candidate) if _candidate.endswith(".dll") and _os.path.sep in _candidate else "n/a"
-                try:
-                    _ct.WinDLL(_candidate)
-                    _f.write(f"  {_candidate} (exists={_exists}): LOADED OK\n")
-                except OSError as _le:
-                    _f.write(f"  {_candidate} (exists={_exists}): {_le!r}\n")
-            _f.write("\n--- bundled tree probe ---\n")
-            for _rel in ("fitz", "fitz/__init__.py", "pymupdf", "pymupdf/__init__.py",
-                         "pymupdf/_mupdf.pyd", "pymupdf/mupdfcpp64.dll", "mupdfcpp64.dll",
-                         "numpy", "numpy/__init__.py"):
-                _abs = _os.path.join(_exe_dir, _rel)
-                _f.write(f"  {_rel}: exists={_os.path.exists(_abs)}\n")
-    except Exception:
-        pass
 
 
 # --------------------------------------------------------------------------- #
@@ -108,8 +62,24 @@ else:
     SCRIPT_DIR = Path(__file__).resolve().parent
 BUNDLE_DIR = Path(__file__).resolve().parent  # for assets shipped with the build
 CLASSES_DIR = SCRIPT_DIR / "Classes"
-SETTINGS_PATH = SCRIPT_DIR / "OpenName.settings.json"
 ICON_PATH = BUNDLE_DIR / "paper.ico"
+
+
+def _writable_data_dir() -> Path:
+    """Per-user writable directory for OpenName settings + default exports.
+
+    Inside an MSIX install SCRIPT_DIR is read-only (Program Files\\WindowsApps),
+    so persisting OpenName.settings.json or defaulting save dialogs there
+    silently fails or gets virtualized into the per-package container where
+    the user can't easily find it. Use %LOCALAPPDATA%\\OpenName\\ instead.
+    """
+    base = os.environ.get("LOCALAPPDATA") or str(Path.home())
+    d = Path(base) / "OpenName"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+SETTINGS_PATH = _writable_data_dir() / "OpenName.settings.json"
 
 
 def _qmark_class_override() -> Path | None:
@@ -931,10 +901,19 @@ class App(QMainWindow):
 
         cls = state["class_label"] or state["last_class"] or "combined"
         default_name = f"{safe_filename(cls)}_combined.pdf"
+        # Default the save dialog to a writable location, not SCRIPT_DIR
+        # (read-only under MSIX). Prefer the qmark-supplied Sheets dir
+        # when launched from the dashboard so exports land alongside the
+        # source worksheet.
+        sheets_dir = os.environ.get("QMARK_SHEETS_DIR", "")
+        if sheets_dir and Path(sheets_dir).is_dir():
+            initial_dir = Path(sheets_dir)
+        else:
+            initial_dir = _writable_data_dir()
         out_path, _ = QFileDialog.getSaveFileName(
             self,
             "Save combined PDF",
-            str(SCRIPT_DIR / default_name),
+            str(initial_dir / default_name),
             "PDF files (*.pdf)",
         )
         if not out_path:
