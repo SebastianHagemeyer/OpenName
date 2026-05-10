@@ -89,6 +89,18 @@ foreach ($pkg in $exclusions) {
     $nuitkaArgs += "--nofollow-import-to=$pkg"
 }
 
+# -WithPreviewFast: Nuitka's deployment mode actively blocks runtime
+# imports of modules listed in --nofollow-import-to, even when the
+# package files are present on sys.path. Without this flag, `import fitz`
+# raises:
+#   ImportError: Module 'fitz' was actively excluded from Nuitka
+#   compilation. Disable with '--no-deployment-flag=excluded-module-usage'
+# Disabling the guard lets the bundled fitz/pymupdf/numpy folders import
+# normally via Python's standard import machinery.
+if ($WithPreviewFast) {
+    $nuitkaArgs += "--no-deployment-flag=excluded-module-usage"
+}
+
 # -WithPreviewFast: pymupdf is bundled below as a POST-BUILD copy of the
 # pre-built site-packages dir, not via --include-data-dir (which silently
 # filters out .pyd/.dll/.py files because it thinks they're code, not
