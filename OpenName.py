@@ -36,6 +36,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from qmark_theme import apply_qmark_theme
+
 try:
     import qrcode
     HAS_QR = True
@@ -510,7 +512,6 @@ class App(QMainWindow):
         none_btn.setFixedWidth(60)
         none_btn.clicked.connect(lambda: self._set_all_students(False))
         self.count_label = QLabel("")
-        self.count_label.setStyleSheet("color: #555;")
         toolbar.addWidget(all_btn)
         toolbar.addWidget(none_btn)
         toolbar.addSpacing(16)
@@ -613,7 +614,6 @@ class App(QMainWindow):
         # ---------------- BOTTOM: status + actions ---------------- #
         bottom = QHBoxLayout()
         self.status_label = QLabel("")
-        self.status_label.setStyleSheet("color: #234;")
         bottom.addWidget(self.status_label, 1)
         self.preview_btn = QPushButton("Open in viewer")
         self.preview_btn.clicked.connect(self._on_preview)
@@ -1073,6 +1073,7 @@ def main() -> None:
         except Exception:
             pass
     app = QApplication(sys.argv)
+    apply_qmark_theme(app)
     if ICON_PATH.exists():
         app.setWindowIcon(QIcon(str(ICON_PATH)))
     win = App()
