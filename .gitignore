@@ -26,6 +26,9 @@ dist/
 *.dist/
 *.onefile-build/
 
+# Build / test logs
+*.log
+
 # IDE / OS
 .vscode/
 .idea/
