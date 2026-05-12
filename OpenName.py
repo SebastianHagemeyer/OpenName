@@ -30,10 +30,11 @@ from reportlab.lib.utils import ImageReader
 from PySide6.QtCore import Qt, QObject, QTimer, Signal
 from PySide6.QtGui import QIcon, QImage, QPixmap
 from PySide6.QtWidgets import (
-    QApplication, QCheckBox, QComboBox, QFileDialog, QFrame, QGridLayout,
-    QGroupBox, QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMessageBox,
-    QPushButton, QScrollArea, QSizePolicy, QSlider, QSpinBox, QVBoxLayout,
-    QWidget,
+    QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog,
+    QDoubleSpinBox, QFileDialog, QFrame, QGridLayout, QGroupBox, QHBoxLayout,
+    QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMessageBox,
+    QProgressBar, QPushButton, QScrollArea, QSizePolicy, QSlider, QSpinBox,
+    QVBoxLayout, QWidget,
 )
 
 from qmark_theme import apply_qmark_theme
@@ -145,6 +146,13 @@ DEFAULTS = {
     "all_pages": False,
     "mark_top_pages": False,
     "include_qr": True,
+    # Batch-print-folder dialog: prints already-rendered PDFs from a folder
+    # one-by-one, with a small delay so SumatraPDF doesn't drop jobs while
+    # the spooler is still accepting the previous one. The printer holds
+    # everything until login at the device anyway, so the delay only needs
+    # to cover data transfer (1-2s is typically enough).
+    "batch_folder": "",
+    "batch_delay_secs": 2.0,
 }
 
 
@@ -369,6 +377,340 @@ class WorkerSignals(QObject):
     info = Signal(str, str)     # title, message
     error = Signal(str, str)    # title, message
     busy = Signal(bool)
+    progress = Signal(int)      # 1-based count of jobs completed in batch
+
+
+class BatchPrintDialog(QDialog):
+    """Send print jobs one-by-one for every PDF in a folder.
+
+    Companion to the main stamp-and-print flow: qmark exports per-student
+    feedback PDFs into Results/, and this dialog forwards each PDF to
+    SumatraPDF with a configurable inter-job delay. The target printer
+    (Follow-Me) holds everything until login at the device anyway, so the
+    delay is just to space out spooler hand-off — 1-2s covers most cases.
+    """
+
+    def __init__(self, parent, settings: dict, save_settings_cb) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Batch print folder")
+        self.resize(640, 600)
+        if ICON_PATH.exists():
+            self.setWindowIcon(QIcon(str(ICON_PATH)))
+        self._settings = settings
+        self._save_settings_cb = save_settings_cb
+        self._signals = WorkerSignals()
+        self._worker: threading.Thread | None = None
+        self._cancel_event = threading.Event()
+        self._pdf_paths: list[Path] = []
+
+        self._build_ui()
+        self._wire()
+
+        initial = self._initial_folder()
+        if initial is not None:
+            self.folder_edit.setText(str(initial))
+            self._refresh_files()
+        else:
+            self._update_count()
+
+    def _initial_folder(self) -> Path | None:
+        saved = (self._settings.get("batch_folder") or "").strip()
+        if saved and Path(saved).is_dir():
+            return Path(saved)
+        env = os.environ.get("QMARK_RESULTS_DIR", "").strip()
+        if env and Path(env).is_dir():
+            return Path(env)
+        local_app = os.environ.get("LOCALAPPDATA", "")
+        if local_app:
+            candidate = Path(local_app) / "Qmark" / "Results"
+            if candidate.is_dir():
+                return candidate
+        sibling = SCRIPT_DIR.parent / "Results"
+        if sibling.is_dir():
+            return sibling
+        return None
+
+    def _build_ui(self) -> None:
+        v = QVBoxLayout(self)
+        v.setContentsMargins(10, 10, 10, 10)
+        v.setSpacing(6)
+
+        folder_row = QHBoxLayout()
+        folder_row.addWidget(QLabel("Folder:"))
+        self.folder_edit = QLineEdit()
+        folder_row.addWidget(self.folder_edit, 1)
+        self.browse_btn = QPushButton("Browse...")
+        folder_row.addWidget(self.browse_btn)
+        self.refresh_btn = QPushButton("Refresh")
+        folder_row.addWidget(self.refresh_btn)
+        v.addLayout(folder_row)
+
+        list_box = QGroupBox("PDFs (uncheck to skip)")
+        lb_v = QVBoxLayout(list_box)
+        toolbar = QHBoxLayout()
+        self.all_btn = QPushButton("All")
+        self.all_btn.setFixedWidth(60)
+        self.none_btn = QPushButton("None")
+        self.none_btn.setFixedWidth(60)
+        self.count_label = QLabel("")
+        toolbar.addWidget(self.all_btn)
+        toolbar.addWidget(self.none_btn)
+        toolbar.addSpacing(16)
+        toolbar.addWidget(self.count_label)
+        toolbar.addStretch(1)
+        lb_v.addLayout(toolbar)
+
+        self.list_widget = QListWidget()
+        self.list_widget.setSelectionMode(QAbstractItemView.NoSelection)
+        lb_v.addWidget(self.list_widget, 1)
+        v.addWidget(list_box, 1)
+
+        pr_row = QHBoxLayout()
+        pr_row.addWidget(QLabel("Printer:"))
+        self.printer_edit = QLineEdit(str(self._settings.get("printer", "")))
+        pr_row.addWidget(self.printer_edit, 1)
+        self.mono_cb = QCheckBox("Monochrome")
+        self.mono_cb.setChecked(bool(self._settings.get("monochrome", True)))
+        pr_row.addWidget(self.mono_cb)
+        v.addLayout(pr_row)
+
+        delay_row = QHBoxLayout()
+        delay_row.addWidget(QLabel("Delay between jobs:"))
+        self.delay_spin = QDoubleSpinBox()
+        self.delay_spin.setRange(0.0, 60.0)
+        self.delay_spin.setSingleStep(0.5)
+        self.delay_spin.setDecimals(1)
+        self.delay_spin.setSuffix(" s")
+        try:
+            self.delay_spin.setValue(float(self._settings.get("batch_delay_secs", 2.0)))
+        except (TypeError, ValueError):
+            self.delay_spin.setValue(2.0)
+        delay_row.addWidget(self.delay_spin)
+        delay_row.addStretch(1)
+        v.addLayout(delay_row)
+
+        self.progress = QProgressBar()
+        self.progress.setRange(0, 1)
+        self.progress.setValue(0)
+        self.progress.setVisible(False)
+        v.addWidget(self.progress)
+
+        self.status_label = QLabel("")
+        v.addWidget(self.status_label)
+
+        btn_row = QHBoxLayout()
+        self.send_btn = QPushButton("Send print jobs")
+        self.stop_btn = QPushButton("Stop")
+        self.stop_btn.setEnabled(False)
+        self.close_btn = QPushButton("Close")
+        btn_row.addStretch(1)
+        btn_row.addWidget(self.send_btn)
+        btn_row.addWidget(self.stop_btn)
+        btn_row.addWidget(self.close_btn)
+        v.addLayout(btn_row)
+
+    def _wire(self) -> None:
+        self.browse_btn.clicked.connect(self._on_browse)
+        self.refresh_btn.clicked.connect(self._refresh_files)
+        self.folder_edit.editingFinished.connect(self._refresh_files)
+        self.all_btn.clicked.connect(lambda: self._check_all(True))
+        self.none_btn.clicked.connect(lambda: self._check_all(False))
+        self.list_widget.itemChanged.connect(self._update_count)
+        self.send_btn.clicked.connect(self._on_send)
+        self.stop_btn.clicked.connect(self._on_stop)
+        self.close_btn.clicked.connect(self.close)
+        self._signals.status.connect(self._set_status)
+        self._signals.error.connect(self._show_error)
+        self._signals.info.connect(self._show_info)
+        self._signals.progress.connect(self._on_progress)
+        self._signals.busy.connect(self._set_busy)
+
+    def _on_browse(self) -> None:
+        start = self.folder_edit.text().strip() or str(Path.home())
+        chosen = QFileDialog.getExistingDirectory(self, "Select folder of PDFs", start)
+        if chosen:
+            self.folder_edit.setText(chosen)
+            self._refresh_files()
+
+    def _refresh_files(self) -> None:
+        folder = self.folder_edit.text().strip()
+        self.list_widget.blockSignals(True)
+        try:
+            self.list_widget.clear()
+            self._pdf_paths = []
+            if not folder:
+                self._set_status("")
+                return
+            folder_path = Path(folder)
+            if not folder_path.is_dir():
+                self._set_status(f"Folder not found: {folder}")
+                return
+            pdfs = sorted(folder_path.glob("*.pdf"), key=lambda p: p.name.lower())
+            for pdf in pdfs:
+                item = QListWidgetItem(pdf.name)
+                item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+                item.setCheckState(Qt.Checked)
+                self.list_widget.addItem(item)
+                self._pdf_paths.append(pdf)
+            if not pdfs:
+                self._set_status(f"No PDFs in: {folder}")
+            else:
+                self._set_status("")
+        finally:
+            self.list_widget.blockSignals(False)
+            self._update_count()
+
+    def _check_all(self, checked: bool) -> None:
+        state = Qt.Checked if checked else Qt.Unchecked
+        self.list_widget.blockSignals(True)
+        try:
+            for i in range(self.list_widget.count()):
+                self.list_widget.item(i).setCheckState(state)
+        finally:
+            self.list_widget.blockSignals(False)
+            self._update_count()
+
+    def _selected_pdfs(self) -> list[Path]:
+        out: list[Path] = []
+        for i in range(self.list_widget.count()):
+            if self.list_widget.item(i).checkState() == Qt.Checked:
+                out.append(self._pdf_paths[i])
+        return out
+
+    def _update_count(self, *_args) -> None:
+        n_total = self.list_widget.count()
+        n_sel = sum(
+            1 for i in range(n_total)
+            if self.list_widget.item(i).checkState() == Qt.Checked
+        )
+        self.count_label.setText(f"{n_sel} of {n_total} selected")
+
+    def _on_send(self) -> None:
+        selected = self._selected_pdfs()
+        if not selected:
+            QMessageBox.warning(self, "No PDFs selected",
+                                "Check at least one PDF to print.")
+            return
+        printer = self.printer_edit.text().strip()
+        if not printer:
+            QMessageBox.warning(self, "No printer", "Enter a printer name first.")
+            return
+        if not SUMATRA_PATH.exists():
+            QMessageBox.critical(self, "SumatraPDF not found",
+                                 f"SumatraPDF not found at:\n{SUMATRA_PATH}")
+            return
+
+        self._settings["batch_folder"] = self.folder_edit.text().strip()
+        self._settings["batch_delay_secs"] = float(self.delay_spin.value())
+        self._settings["printer"] = printer
+        self._settings["monochrome"] = bool(self.mono_cb.isChecked())
+        try:
+            self._save_settings_cb()
+        except Exception:
+            pass
+
+        self._cancel_event.clear()
+        self.progress.setRange(0, len(selected))
+        self.progress.setValue(0)
+        self.progress.setVisible(True)
+        self._set_busy(True)
+        self._worker = threading.Thread(
+            target=self._send_worker,
+            args=(selected, printer, bool(self.mono_cb.isChecked()),
+                  float(self.delay_spin.value())),
+            daemon=True,
+        )
+        self._worker.start()
+
+    def _on_stop(self) -> None:
+        self._cancel_event.set()
+        self._set_status("Stopping after current job...")
+
+    def _send_worker(self, pdfs: list[Path], printer: str,
+                     monochrome: bool, delay: float) -> None:
+        sent = 0
+        try:
+            for i, pdf in enumerate(pdfs, 1):
+                if self._cancel_event.is_set():
+                    break
+                self._signals.status.emit(f"Sending {i} of {len(pdfs)}: {pdf.name}")
+                send_to_printer(pdf, printer, monochrome)
+                sent = i
+                self._signals.progress.emit(i)
+                if i < len(pdfs) and delay > 0:
+                    # Chunked sleep so Stop is responsive without
+                    # busy-waiting.
+                    end = time.monotonic() + delay
+                    while time.monotonic() < end:
+                        if self._cancel_event.is_set():
+                            break
+                        time.sleep(min(0.1, max(0.0, end - time.monotonic())))
+            if self._cancel_event.is_set():
+                self._signals.status.emit(
+                    f"Stopped. Sent {sent} of {len(pdfs)} job(s)."
+                )
+                self._signals.info.emit(
+                    "Stopped",
+                    f"Stopped after sending {sent} of {len(pdfs)} job(s) "
+                    f"to {printer}.",
+                )
+            else:
+                self._signals.status.emit(f"Done. Sent {sent} print job(s).")
+                self._signals.info.emit(
+                    "Done", f"Sent {sent} print job(s) to {printer}."
+                )
+        except Exception as e:
+            self._signals.status.emit(f"Error: {e}")
+            self._signals.error.emit("Batch print error", str(e))
+        finally:
+            self._signals.busy.emit(False)
+
+    def _set_status(self, msg: str) -> None:
+        self.status_label.setText(msg)
+
+    def _show_info(self, title: str, msg: str) -> None:
+        QMessageBox.information(self, title, msg)
+
+    def _show_error(self, title: str, msg: str) -> None:
+        QMessageBox.critical(self, title, msg)
+
+    def _on_progress(self, value: int) -> None:
+        self.progress.setValue(value)
+
+    def _set_busy(self, busy: bool) -> None:
+        self.send_btn.setEnabled(not busy)
+        self.stop_btn.setEnabled(busy)
+        self.browse_btn.setEnabled(not busy)
+        self.refresh_btn.setEnabled(not busy)
+        self.folder_edit.setReadOnly(busy)
+        self.printer_edit.setReadOnly(busy)
+        self.delay_spin.setEnabled(not busy)
+        self.mono_cb.setEnabled(not busy)
+        self.all_btn.setEnabled(not busy)
+        self.none_btn.setEnabled(not busy)
+        self.list_widget.setEnabled(not busy)
+        if not busy:
+            QTimer.singleShot(2000, lambda: self.progress.setVisible(False))
+
+    def closeEvent(self, event) -> None:  # type: ignore[override]
+        if self._worker is not None and self._worker.is_alive():
+            reply = QMessageBox.question(
+                self, "Batch in progress",
+                "A batch is still running. Stop and close?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if reply != QMessageBox.Yes:
+                event.ignore()
+                return
+            self._cancel_event.set()
+        self._settings["batch_folder"] = self.folder_edit.text().strip()
+        self._settings["batch_delay_secs"] = float(self.delay_spin.value())
+        try:
+            self._save_settings_cb()
+        except Exception:
+            pass
+        super().closeEvent(event)
 
 
 # --------------------------------------------------------------------------- #
@@ -386,6 +728,7 @@ class App(QMainWindow):
 
         self.settings = self._load_settings()
         self.student_checks: list[tuple[QCheckBox, str]] = []
+        self._batch_dialog: "BatchPrintDialog | None" = None
         self._busy = False
         self._preview_pixmap: QPixmap | None = None
 
@@ -624,6 +967,13 @@ class App(QMainWindow):
         self.print_btn = QPushButton("Print Selected")
         self.print_btn.clicked.connect(self._on_print)
         bottom.addWidget(self.print_btn)
+        self.batch_btn = QPushButton("Batch print folder...")
+        self.batch_btn.setToolTip(
+            "Send every PDF in a folder to the printer one at a time — "
+            "useful for printing qmark Results/ exports."
+        )
+        self.batch_btn.clicked.connect(self._open_batch_print)
+        bottom.addWidget(self.batch_btn)
         close_btn = QPushButton("Close")
         close_btn.clicked.connect(self.close)
         bottom.addWidget(close_btn)
@@ -1000,6 +1350,20 @@ class App(QMainWindow):
         threading.Thread(
             target=self._print_worker, args=(sel, state, pdf_in), daemon=True
         ).start()
+
+    def _open_batch_print(self) -> None:
+        # Non-modal: keep the dialog around so the user can keep working in
+        # the stamp window while a long print queue drains.
+        existing = self._batch_dialog
+        if existing is not None and existing.isVisible():
+            existing.raise_()
+            existing.activateWindow()
+            return
+        dlg = BatchPrintDialog(self, self.settings, self._save_settings)
+        dlg.setAttribute(Qt.WA_DeleteOnClose, True)
+        dlg.destroyed.connect(lambda *_: setattr(self, "_batch_dialog", None))
+        self._batch_dialog = dlg
+        dlg.show()
 
     def _print_worker(self, students: list[str], state: dict, pdf_in: Path) -> None:
         tmp_dir = Path(tempfile.mkdtemp(prefix="OpenName_"))
