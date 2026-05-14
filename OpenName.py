@@ -64,7 +64,11 @@ if "__compiled__" in globals() or getattr(sys, "frozen", False):
 else:
     SCRIPT_DIR = Path(__file__).resolve().parent
 BUNDLE_DIR = Path(__file__).resolve().parent  # for assets shipped with the build
-CLASSES_DIR = SCRIPT_DIR / "Classes"
+# qmark passes QMARK_CLASSES_DIR pointing at the dashboard's configured
+# classes folder (Set Default Folders -> Classes). When unset, fall back to
+# the local Classes/ next to OpenName.
+_qmark_classes_env = os.environ.get("QMARK_CLASSES_DIR", "").strip()
+CLASSES_DIR = Path(_qmark_classes_env) if _qmark_classes_env else SCRIPT_DIR / "Classes"
 ICON_PATH = BUNDLE_DIR / "paper.ico"
 
 
