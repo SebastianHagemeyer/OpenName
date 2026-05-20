@@ -25,10 +25,11 @@ from pathlib import Path
 import openpyxl
 from pypdf import PdfReader, PdfWriter
 from reportlab.pdfgen import canvas as rl_canvas
+from reportlab.pdfbase.pdfmetrics import stringWidth
 from reportlab.lib.utils import ImageReader
 
-from PySide6.QtCore import Qt, QObject, QTimer, Signal
-from PySide6.QtGui import QIcon, QImage, QPixmap
+from PySide6.QtCore import Qt, QObject, QPoint, QRect, QTimer, Signal
+from PySide6.QtGui import QColor, QIcon, QImage, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog,
     QDoubleSpinBox, QFileDialog, QFrame, QGridLayout, QGroupBox, QHBoxLayout,
@@ -365,13 +366,236 @@ class LinkedSpin(QWidget):
 
 
 class PreviewLabel(QLabel):
-    """QLabel that re-emits its resize so the preview can be re-rasterised."""
+    """QLabel that displays the live PDF preview and lets the user click-drag
+    each stamped element (name, class, date, QR) directly on the page.
+
+    Two coordinate systems are in play:
+      - PDF points (top-left origin) — what the rest of the app stores in
+        the spin boxes and writes to settings.
+      - Label pixels — what we draw and hit-test in.
+
+    `set_preview(pixmap, page_w_pt, page_h_pt)` hands us the rasterised PDF
+    and the page size; we derive scale + offset from the label's geometry
+    so element rects can round-trip between point space and pixel space
+    without the App caring about the centring offset.
+
+    `set_elements([...])` pushes the list of draggable elements in PDF-point
+    coordinates. Each element is a dict:
+        { 'key': 'name', 'label': 'Name', 'x': 130, 'y': 80, 'w': 60, 'h': 14 }
+    where (x, y) is the **visual top-left** of the bounding box (NOT the
+    text baseline). The App converts baseline-y -> top-y for us so the
+    outline visually surrounds the glyphs.
+
+    Drag emits `dragged(key, new_x_pt, new_y_pt)` with the new visual
+    top-left. The App handler converts back to baseline-y and writes the
+    spinboxes (which are still the source of truth + drive persistence).
+    """
 
     resized = Signal()
+    dragged = Signal(str, float, float)  # key, x_pt, y_pt (continuous)
+    released = Signal()                  # mouse-up after a drag (final)
+
+    _OUTLINE_COLOR = QColor(220, 30, 40)
+    _OUTLINE_WIDTH = 1.5
+    _HIT_PAD_PX = 4  # extra hit area so tiny text rects stay grabbable
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._pix: QPixmap | None = None
+        self._page_w_pt = 0.0
+        self._page_h_pt = 0.0
+        self._elements: list[dict] = []
+        # Drag state — `_drag_key` is non-None while the user is dragging.
+        self._drag_key: str | None = None
+        self._drag_offset_px = QPoint(0, 0)
+        self._hover_key: str | None = None
+        self.setMouseTracking(True)  # so cursor updates without a press
 
     def resizeEvent(self, event):  # type: ignore[override]
         super().resizeEvent(event)
         self.resized.emit()
+
+    # ---- data hooks (called by App._update_preview) ---------------------- #
+
+    def set_preview(self, pixmap: QPixmap | None,
+                    page_w_pt: float, page_h_pt: float) -> None:
+        self._pix = pixmap
+        self._page_w_pt = float(page_w_pt) if page_w_pt else 0.0
+        self._page_h_pt = float(page_h_pt) if page_h_pt else 0.0
+        self.update()
+
+    def set_elements(self, elements: list[dict]) -> None:
+        self._elements = list(elements)
+        self.update()
+
+    def clear_elements(self) -> None:
+        self._elements = []
+        self.update()
+
+    # ---- coordinate mapping --------------------------------------------- #
+
+    def _pixmap_geometry(self) -> tuple[float, QPoint] | None:
+        """Return (scale_px_per_pt, top_left_of_pixmap_in_label_coords).
+
+        Returns None if there is no pixmap yet, the page size is unknown,
+        or the label is too small to render meaningfully — in which case
+        callers should skip painting/hit-testing.
+        """
+        if (self._pix is None or self._pix.isNull()
+                or self._page_w_pt <= 0 or self._page_h_pt <= 0):
+            return None
+        pw = self._pix.width()
+        ph = self._pix.height()
+        if pw <= 0 or ph <= 0:
+            return None
+        # The preview is rendered at `min(cw/page_w, ch/page_h)` so the
+        # ratio is uniform — either width fills or height fills.
+        scale = pw / self._page_w_pt
+        ox = (self.width() - pw) // 2
+        oy = (self.height() - ph) // 2
+        return scale, QPoint(ox, oy)
+
+    def _rect_for_element(self, el: dict) -> QRect | None:
+        geom = self._pixmap_geometry()
+        if geom is None:
+            return None
+        scale, origin = geom
+        x = origin.x() + int(round(float(el["x"]) * scale))
+        y = origin.y() + int(round(float(el["y"]) * scale))
+        w = max(1, int(round(float(el["w"]) * scale)))
+        h = max(1, int(round(float(el["h"]) * scale)))
+        return QRect(x, y, w, h)
+
+    def _hit_test(self, pos: QPoint) -> str | None:
+        # Walk reverse so visually-last (top) elements grab clicks first.
+        for el in reversed(self._elements):
+            r = self._rect_for_element(el)
+            if r is None:
+                continue
+            hit = r.adjusted(
+                -self._HIT_PAD_PX, -self._HIT_PAD_PX,
+                self._HIT_PAD_PX, self._HIT_PAD_PX,
+            )
+            if hit.contains(pos):
+                return str(el["key"])
+        return None
+
+    # ---- painting ------------------------------------------------------- #
+
+    def paintEvent(self, event):  # type: ignore[override]
+        super().paintEvent(event)
+        if self._pix is None or self._pix.isNull():
+            return
+        p = QPainter(self)
+        try:
+            p.setRenderHint(QPainter.Antialiasing, True)
+            geom = self._pixmap_geometry()
+            if geom is None:
+                return
+            scale, origin = geom
+            # We don't blit the pixmap here — QLabel.setPixmap already does
+            # that with centring. Draw outlines on top.
+            for el in self._elements:
+                r = self._rect_for_element(el)
+                if r is None:
+                    continue
+                pen = QPen(self._OUTLINE_COLOR)
+                pen.setWidthF(self._OUTLINE_WIDTH)
+                pen.setCosmetic(True)
+                # Ghost elements (e.g. the page-2+ stamp, which isn't
+                # drawn on page 1) render dashed so the user knows the
+                # outline is positional-only and won't actually appear
+                # on this page.
+                if el.get("ghost"):
+                    pen.setStyle(Qt.DashLine)
+                p.setPen(pen)
+                p.drawRect(r)
+        finally:
+            p.end()
+
+    # ---- mouse interaction ---------------------------------------------- #
+
+    def mousePressEvent(self, event):  # type: ignore[override]
+        if event.button() == Qt.LeftButton:
+            key = self._hit_test(event.position().toPoint())
+            if key is not None:
+                self._drag_key = key
+                el = self._element_by_key(key)
+                if el is not None:
+                    r = self._rect_for_element(el)
+                    if r is not None:
+                        self._drag_offset_px = (event.position().toPoint()
+                                                - r.topLeft())
+                self.setCursor(Qt.ClosedHandCursor)
+                event.accept()
+                return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):  # type: ignore[override]
+        pos = event.position().toPoint()
+        if self._drag_key is not None:
+            self._emit_drag(pos)
+            event.accept()
+            return
+        # Hover feedback: open hand when over a draggable element.
+        key = self._hit_test(pos)
+        if key != self._hover_key:
+            self._hover_key = key
+            self.setCursor(Qt.OpenHandCursor if key else Qt.ArrowCursor)
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):  # type: ignore[override]
+        if event.button() == Qt.LeftButton and self._drag_key is not None:
+            self._emit_drag(event.position().toPoint())
+            self._drag_key = None
+            # Restore hover cursor if still over an element.
+            key = self._hit_test(event.position().toPoint())
+            self._hover_key = key
+            self.setCursor(Qt.OpenHandCursor if key else Qt.ArrowCursor)
+            # Fire `released` so the App can force an immediate preview
+            # re-rasterise (no debounce) - otherwise the red outline sits
+            # at the new position but the actual stamp stays at the old
+            # one until something else schedules a redraw.
+            self.released.emit()
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    def leaveEvent(self, event):  # type: ignore[override]
+        if self._drag_key is None:
+            self._hover_key = None
+            self.setCursor(Qt.ArrowCursor)
+        super().leaveEvent(event)
+
+    def _element_by_key(self, key: str) -> dict | None:
+        for el in self._elements:
+            if el.get("key") == key:
+                return el
+        return None
+
+    def _emit_drag(self, pos: QPoint) -> None:
+        geom = self._pixmap_geometry()
+        if geom is None or self._drag_key is None:
+            return
+        scale, origin = geom
+        # New top-left in label pixels, accounting for where the user
+        # initially grabbed the element so it doesn't snap under the cursor.
+        new_topleft_px = pos - self._drag_offset_px
+        x_pt = (new_topleft_px.x() - origin.x()) / scale
+        y_pt = (new_topleft_px.y() - origin.y()) / scale
+        # Clamp into page bounds so the user can't fling an element off.
+        el = self._element_by_key(self._drag_key)
+        if el is not None:
+            w_pt = float(el["w"])
+            h_pt = float(el["h"])
+            x_pt = max(0.0, min(self._page_w_pt - w_pt, x_pt))
+            y_pt = max(0.0, min(self._page_h_pt - h_pt, y_pt))
+            # Update the local rect immediately so the outline tracks the
+            # cursor smoothly even while the rasterised preview is debounced.
+            el["x"] = x_pt
+            el["y"] = y_pt
+            self.update()
+        self.dragged.emit(self._drag_key, x_pt, y_pt)
 
 
 class WorkerSignals(QObject):
@@ -878,17 +1102,22 @@ class App(QMainWindow):
         sb_v.addWidget(self.students_scroll, 1)
         left_v.addWidget(students_box, 1)
 
-        # Stamp positions (with sliders)
-        pos_box = QGroupBox("Stamp positions (points; drag sliders to move)")
-        pos_grid = QGridLayout(pos_box)
-        pos_grid.setHorizontalSpacing(6)
-        pos_grid.setVerticalSpacing(4)
-        self.name_x, self.name_y   = self._make_pos_row(pos_grid, 0, "Name field:",      int(self.settings["name_x"]),  int(self.settings["name_y"]))
-        self.class_x, self.class_y = self._make_pos_row(pos_grid, 1, "Class field:",     int(self.settings["class_x"]), int(self.settings["class_y"]))
-        self.date_x, self.date_y   = self._make_pos_row(pos_grid, 2, "Date field:",      int(self.settings["date_x"]),  int(self.settings["date_y"]))
-        self.top_x, self.top_y     = self._make_pos_row(pos_grid, 3, "Top of pages 2+:", int(self.settings["top_x"]),   int(self.settings["top_y"]))
-        self.qr_x, self.qr_y       = self._make_pos_row(pos_grid, 4, "QR code:",         int(self.settings["qr_x"]),    int(self.settings["qr_y"]))
-        left_v.addWidget(pos_box)
+        # Stamp positions are set by dragging the red-outlined elements
+        # on the live preview - the old slider grid was visual noise.
+        # We still create LinkedSpin instances (parented to `self` but
+        # not added to any layout) because they remain the canonical
+        # store for x/y values + drive `_read_form_state` and settings
+        # persistence; drag handlers write into them via `set_value`.
+        self.name_x, self.name_y = self._make_hidden_pos(
+            self.settings["name_x"], self.settings["name_y"], slider_max_y=850)
+        self.class_x, self.class_y = self._make_hidden_pos(
+            self.settings["class_x"], self.settings["class_y"], slider_max_y=850)
+        self.date_x, self.date_y = self._make_hidden_pos(
+            self.settings["date_x"], self.settings["date_y"], slider_max_y=850)
+        self.top_x, self.top_y = self._make_hidden_pos(
+            self.settings["top_x"], self.settings["top_y"], slider_max_y=850)
+        self.qr_x, self.qr_y = self._make_hidden_pos(
+            self.settings["qr_x"], self.settings["qr_y"], slider_max_y=850)
 
         # Multi-page options
         self.allpages_cb = QCheckBox("Stamp full Name+Class+Date on every page")
@@ -985,15 +1214,17 @@ class App(QMainWindow):
 
         self._update_date_state(self.include_date_cb.isChecked())
 
-    def _make_pos_row(self, grid: QGridLayout, row: int, label: str,
-                      x_value: int, y_value: int) -> tuple[LinkedSpin, LinkedSpin]:
-        grid.addWidget(QLabel(label), row, 0)
-        grid.addWidget(QLabel("X"), row, 1)
-        x_widget = LinkedSpin(x_value, slider_max=600)
-        grid.addWidget(x_widget, row, 2)
-        grid.addWidget(QLabel("Y"), row, 3)
-        y_widget = LinkedSpin(y_value, slider_max=850)
-        grid.addWidget(y_widget, row, 4)
+    def _make_hidden_pos(self, x_value: int, y_value: int,
+                         slider_max_x: int = 600,
+                         slider_max_y: int = 850
+                         ) -> tuple[LinkedSpin, LinkedSpin]:
+        """Create x/y LinkedSpin state holders parented to `self` but not
+        added to any layout. They stay invisible while still serving as
+        the canonical store for the position values."""
+        x_widget = LinkedSpin(int(x_value), slider_max=slider_max_x, parent=self)
+        y_widget = LinkedSpin(int(y_value), slider_max=slider_max_y, parent=self)
+        x_widget.hide()
+        y_widget.hide()
         return x_widget, y_widget
 
     # ---- signal wiring -------------------------------------------------- #
@@ -1012,6 +1243,12 @@ class App(QMainWindow):
         self.allpages_cb.toggled.connect(self._schedule_preview)
         self.marktop_cb.toggled.connect(self._schedule_preview)
         self.includeqr_cb.toggled.connect(self._schedule_preview)
+        # Drag a red-outlined element on the preview -> update the matching
+        # spinboxes. `set_value` deliberately doesn't re-emit its custom
+        # `valueChanged`, so we must schedule the preview manually inside
+        # the drag handler (during) and force one immediately on release.
+        self.preview_label.dragged.connect(self._on_element_dragged)
+        self.preview_label.released.connect(self._update_preview)
 
     def _update_date_state(self, checked: bool) -> None:
         """Grey out the date entry when 'Include date' is unchecked."""
@@ -1067,10 +1304,108 @@ class App(QMainWindow):
                 )
                 self._preview_pixmap = QPixmap.fromImage(qimg)
                 self.preview_label.setPixmap(self._preview_pixmap)
+                self.preview_label.set_preview(
+                    self._preview_pixmap,
+                    page.rect.width, page.rect.height,
+                )
+                self._push_drag_elements(state, name)
             finally:
                 doc.close()
         except Exception as e:
             self._set_status(f"Preview error: {e}")
+
+    # Helvetica metrics, as a fraction of font_size. Used to convert the
+    # reportlab baseline-y the user adjusts into the visual top of the
+    # cap-height box that the red outline traces. Values from the Adobe
+    # Helvetica AFM (ascent 718/1000, descent 207/1000).
+    _HELV_ASCENT = 0.72
+    _HELV_DESCENT = 0.21
+
+    def _push_drag_elements(self, state: dict, sample_name: str) -> None:
+        """Build the list of draggable bounding boxes for the current
+        preview and hand it to the label. Only outlines elements that
+        are actually drawn on page 1 — the 'top of pages 2+' stamp is
+        invisible here, so we leave it slider-only."""
+        font_size = float(state["font_size"])
+        ascent = font_size * self._HELV_ASCENT
+        descent = font_size * self._HELV_DESCENT
+
+        def _text_box(text: str, x_pt: float, baseline_y_pt: float,
+                      key: str, label: str) -> dict | None:
+            if not text:
+                return None
+            w = stringWidth(str(text), "Helvetica", font_size)
+            return {
+                "key": key,
+                "label": label,
+                "x": float(x_pt),
+                "y": float(baseline_y_pt) - ascent,
+                "w": float(w),
+                "h": float(ascent + descent),
+            }
+
+        items: list[dict] = []
+        nb = _text_box(sample_name, state["name_x"], state["name_y"],
+                       "name", "Name")
+        if nb:
+            items.append(nb)
+        cb = _text_box(state["class_label"], state["class_x"], state["class_y"],
+                       "class", "Class")
+        if cb:
+            items.append(cb)
+        if state["include_date"]:
+            db = _text_box(state["date_text"], state["date_x"], state["date_y"],
+                           "date", "Date")
+            if db:
+                items.append(db)
+        if state["include_qr"]:
+            qr_size = float(state["qr_size"])
+            items.append({
+                "key": "qr", "label": "QR",
+                "x": float(state["qr_x"]),
+                "y": float(state["qr_y"]),
+                "w": qr_size, "h": qr_size,
+            })
+        # The page-2+ small name stamp isn't drawn on page 1 of the
+        # preview, but the user still needs a way to position it now
+        # that the sliders are gone. Show it as a dashed ghost outline
+        # whenever 'Mark name at top of pages 2+' is on.
+        if state["mark_top_pages"]:
+            tb = _text_box(sample_name, state["top_x"], state["top_y"],
+                           "top", "Top (pages 2+)")
+            if tb is not None:
+                tb["ghost"] = True
+                items.append(tb)
+        self.preview_label.set_elements(items)
+
+    def _on_element_dragged(self, key: str, x_pt: float, y_pt: float) -> None:
+        """Apply a drag from the preview to the matching spinboxes.
+
+        The label hands us the visual top-left of the element. Text spins
+        store the baseline-from-top, so we add the Helvetica ascent back
+        on. QR spins already store top-left. Writing to the spins triggers
+        `_schedule_preview` via the existing wiring, so the rasterised
+        preview catches up after the debounce.
+        """
+        ascent = float(self.font_spin.value()) * self._HELV_ASCENT
+        targets = {
+            "name":  (self.name_x,  self.name_y,  ascent),
+            "class": (self.class_x, self.class_y, ascent),
+            "date":  (self.date_x,  self.date_y,  ascent),
+            "top":   (self.top_x,   self.top_y,   ascent),
+            "qr":    (self.qr_x,    self.qr_y,    0.0),
+        }
+        pair = targets.get(key)
+        if pair is None:
+            return
+        x_widget, y_widget, baseline_offset = pair
+        x_widget.set_value(int(round(x_pt)))
+        y_widget.set_value(int(round(y_pt + baseline_offset)))
+        # set_value() is intentionally silent (so the spin/slider sync
+        # doesn't fight itself), so the wiring in `_wire_signals` won't
+        # fire. Schedule the preview ourselves so the rasterised stamp
+        # tries to follow the cursor during the drag.
+        self._schedule_preview()
 
     # ---- class / student data ------------------------------------------- #
 
