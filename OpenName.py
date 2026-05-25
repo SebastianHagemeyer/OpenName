@@ -65,6 +65,17 @@ if "__compiled__" in globals() or getattr(sys, "frozen", False):
 else:
     SCRIPT_DIR = Path(__file__).resolve().parent
 BUNDLE_DIR = Path(__file__).resolve().parent  # for assets shipped with the build
+
+
+def _display_path(p) -> str:
+    """Forward-slash a path for UI display. Windows accepts either
+    separator for file I/O, so this is purely cosmetic — keeps QLineEdit
+    contents looking consistent regardless of whether the value came
+    from a QFileDialog (backslashes), an env var from qmark (already
+    forward-slashed), or settings JSON written by a prior session."""
+    if not p:
+        return ""
+    return str(p).replace("\\", "/")
 # qmark passes QMARK_CLASSES_DIR pointing at the dashboard's configured
 # classes folder (Set Default Folders -> Classes). When unset, fall back to
 # the local Classes/ next to OpenName.
@@ -636,7 +647,7 @@ class BatchPrintDialog(QDialog):
 
         initial = self._initial_folder()
         if initial is not None:
-            self.folder_edit.setText(str(initial))
+            self.folder_edit.setText(_display_path(initial))
             self._refresh_files()
         else:
             self._update_count()
@@ -757,7 +768,7 @@ class BatchPrintDialog(QDialog):
         start = self.folder_edit.text().strip() or str(Path.home())
         chosen = QFileDialog.getExistingDirectory(self, "Select folder of PDFs", start)
         if chosen:
-            self.folder_edit.setText(chosen)
+            self.folder_edit.setText(_display_path(chosen))
             self._refresh_files()
 
     def _refresh_files(self) -> None:
@@ -956,6 +967,12 @@ class App(QMainWindow):
 
         self.settings = self._load_settings()
         self.student_checks: list[tuple[QCheckBox, str]] = []
+        # One-shot consumed on the first _load_class — qmark passes a
+        # JSON list of "no need to reprint" students (scans / marking /
+        # disseminated / printed already), and we pre-uncheck those.
+        # Cleared after applying so subsequent class switches inside
+        # OpenName don't keep replaying the stale launch hint.
+        self._qmark_uncheck_applied = False
         self._batch_dialog: "BatchPrintDialog | None" = None
         self._busy = False
         self._preview_pixmap: QPixmap | None = None
@@ -1048,7 +1065,7 @@ class App(QMainWindow):
         pdf_row = QHBoxLayout()
         pdf_label = QLabel("PDF:")
         pdf_label.setFixedWidth(64)
-        self.pdf_edit = QLineEdit(self.settings["last_pdf"])
+        self.pdf_edit = QLineEdit(_display_path(self.settings["last_pdf"]))
         browse_btn = QPushButton("Browse...")
         browse_btn.clicked.connect(self._browse_pdf)
         pdf_row.addWidget(pdf_label)
@@ -1467,17 +1484,39 @@ class App(QMainWindow):
         if not self.classlabel_edit.text().strip():
             self.classlabel_edit.setText(cls)
 
+        # One-shot launch hint from qmark: students already past the
+        # "needs a paper" stage. Read on the very first class load only,
+        # so manually flipping classes later doesn't re-apply stale data.
+        skip_set: set[str] = set()
+        if not self._qmark_uncheck_applied:
+            raw = os.environ.get("QMARK_OPENNAME_UNCHECK_JSON", "").strip()
+            if raw:
+                try:
+                    parsed = json.loads(raw)
+                    if isinstance(parsed, list):
+                        skip_set = {str(x) for x in parsed}
+                except (ValueError, TypeError):
+                    pass
+            self._qmark_uncheck_applied = True
+
         cols = 3
         for c in range(cols):
             self.students_grid.setColumnStretch(c, 1)
         for idx, name in enumerate(names):
             cb = QCheckBox(name)
-            cb.setChecked(True)
+            cb.setChecked(name not in skip_set)
             cb.toggled.connect(self._schedule_preview)
             self.students_grid.addWidget(cb, idx // cols, idx % cols)
             self.student_checks.append((cb, name))
 
-        self.count_label.setText(f"{len(names)} students loaded")
+        skipped = sum(1 for _, n in self.student_checks if n in skip_set)
+        if skipped:
+            self.count_label.setText(
+                f"{len(names)} students loaded ({skipped} pre-unchecked "
+                f"— already scanned / marked / sent)"
+            )
+        else:
+            self.count_label.setText(f"{len(names)} students loaded")
         self._set_status("")
         self._schedule_preview()
 
@@ -1504,7 +1543,7 @@ class App(QMainWindow):
             "PDF files (*.pdf);;All files (*.*)",
         )
         if path:
-            self.pdf_edit.setText(path)
+            self.pdf_edit.setText(_display_path(path))
 
     def _read_form_state(self) -> dict:
         include_date = self.include_date_cb.isChecked()
