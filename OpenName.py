@@ -653,6 +653,14 @@ class BatchPrintDialog(QDialog):
             self._update_count()
 
     def _initial_folder(self) -> Path | None:
+        # Highest priority: qmark's Print Feedback flow drops the
+        # selected students' PDFs into a temp queue folder and passes
+        # the path here. Wins over the user's last-saved batch_folder
+        # so the one-click handoff doesn't get hijacked by a stale
+        # preference.
+        queue = os.environ.get("QMARK_BATCH_PRINT_DIR", "").strip()
+        if queue and Path(queue).is_dir():
+            return Path(queue)
         saved = (self._settings.get("batch_folder") or "").strip()
         if saved and Path(saved).is_dir():
             return Path(saved)
@@ -993,6 +1001,13 @@ class App(QMainWindow):
         self._refresh_classes()
         self._refresh_students()
         QTimer.singleShot(120, self._update_preview)
+        # qmark's "Print Feedback" flow sets QMARK_OPENNAME_AUTO_BATCH=1
+        # to skip the stamp-and-print window and drop the user straight
+        # into the Batch-print dialog with the queued PDF folder
+        # pre-loaded. Defer until after the main window paints so the
+        # dialog stacks on top cleanly.
+        if os.environ.get("QMARK_OPENNAME_AUTO_BATCH", "").strip() == "1":
+            QTimer.singleShot(0, self._open_batch_print)
 
     # ---- settings -------------------------------------------------------- #
 
